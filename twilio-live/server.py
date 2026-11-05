@@ -36,18 +36,38 @@ def load_dotenv() -> None:
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+def _assemble_openai_key_from_parts() -> None:
+    """Rebuild OPENAI_API_KEY from OPENAI_API_KEY_P00, P01, ... when it is missing or too short."""
+    current = os.environ.get("OPENAI_API_KEY", "")
+    if len(current) > 20:
+        return
+    parts: list[str] = []
+    index = 0
+    while True:
+        name = f"OPENAI_API_KEY_P{index:02d}"
+        if name not in os.environ:
+            break
+        parts.append(os.environ[name])
+        index += 1
+    if parts:
+        os.environ["OPENAI_API_KEY"] = "".join(parts)
+
+
 def llm_config() -> tuple[str, str, str]:
     """Return (base_url, api_key, model). Prefers xAI Grok, then OpenAI."""
-    if os.environ.get("XAI_API_KEY"):
+    _assemble_openai_key_from_parts()
+    xai_key = os.environ.get("XAI_API_KEY", "")
+    if len(xai_key) > 20:
         return (
             os.environ.get("XAI_BASE_URL", "https://api.x.ai/v1"),
-            os.environ["XAI_API_KEY"],
+            xai_key,
             os.environ.get("XAI_MODEL", "grok-2-latest"),
         )
-    if os.environ.get("OPENAI_API_KEY"):
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if len(openai_key) > 20:
         return (
             os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            os.environ["OPENAI_API_KEY"],
+            openai_key,
             os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
         )
     raise RuntimeError("No XAI_API_KEY or OPENAI_API_KEY set for Sal live voice")
@@ -108,7 +128,10 @@ async def handle_fallback(request: web.Request) -> web.Response:
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    ok_llm = bool(os.environ.get("XAI_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+    _assemble_openai_key_from_parts()
+    xai_key = os.environ.get("XAI_API_KEY", "")
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    ok_llm = len(xai_key) > 20 or len(openai_key) > 20
     return web.json_response(
         {
             "ok": True,
