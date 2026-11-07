@@ -25,7 +25,7 @@ PERSONA = (ROOT / "sal_persona.txt").read_text(encoding="utf-8").strip()
 LOG = logging.getLogger("sal-live")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-DEFAULT_GREETING = "Hey Seif, it's Sal on the live line. What can I handle for you?"
+DEFAULT_GREETING = "Hey Seif, it's Sal, Chief Operations Manager at NordSpecAuto. What can I handle for you?"
 REPROMPT_1 = "I'm still here whenever you're ready, Seif — what would you like me to jump on?"
 REPROMPT_2 = "Sounds like you're tied up — everything's in our chat whenever you're ready. Talk soon."
 EMPTY_GOODBYE = "Alright Seif, I'll take it from here. Talk soon."
@@ -36,7 +36,7 @@ SESSION_KEEP = 100
 
 FALLBACK_SAY = os.environ.get(
     "SAL_LIVE_FALLBACK_SAY",
-    "Hi Seif, this is Sal. The live line did not connect, so here is a short update only. Check the chat for details. Goodbye.",
+    "Hey Seif, it's Sal, Chief Operations Manager at NordSpecAuto. The live line did not connect, so here is a short update only. Check the chat for details. Goodbye.",
 )
 
 SPOKEN_RULES = """
@@ -613,14 +613,14 @@ def twiml_live() -> str:
     base = configured_public_base()
     if not base:
         response = VoiceResponse()
-        response.say(FALLBACK_SAY, voice="Polly.Matthew")
+        response.say(FALLBACK_SAY, voice=tts_voice())
         return str(response)
     response = VoiceResponse()
     connect = response.connect(action=f"{base}/voice/fallback", method="POST")
     wss = base.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
     connect.conversation_relay(
         url=wss,
-        welcome_greeting="Hi Seif, this is Sal on the live line. What do you need?",
+        welcome_greeting=DEFAULT_GREETING,
         language="en-US",
     )
     return str(response)
@@ -628,7 +628,7 @@ def twiml_live() -> str:
 
 def twiml_fallback() -> str:
     response = VoiceResponse()
-    response.say(FALLBACK_SAY, voice="Polly.Matthew")
+    response.say(FALLBACK_SAY, voice=tts_voice())
     return str(response)
 
 

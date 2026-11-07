@@ -37,7 +37,7 @@ curl -s -X POST "$SAL_LIVE_PUBLIC_BASE/api/sessions" \
   }'
 ```
 
-`greeting` defaults to `Hey Seif, it's Sal on the live line. What can I handle for you?`. `context` is injected into the LLM system prompt for that call only. `caller_note` is a tag such as `morning_briefing` or `on_demand`.
+`greeting` defaults to `Hey Seif, it's Sal, Chief Operations Manager at NordSpecAuto. What can I handle for you?`. `context` is injected into the LLM system prompt for that call only. `caller_note` is a tag such as `morning_briefing` or `on_demand`.
 
 Response:
 

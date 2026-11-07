@@ -146,11 +146,39 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("xml", live.content_type)
         self.assertIn("<ConversationRelay", live_xml)
         self.assertIn("wss://sal-live.onrender.com/ws", live_xml)
+        self.assertIn("Chief Operations Manager at NordSpecAuto", live_xml)
+        self.assertIn("What can I handle for you?", live_xml)
 
         fallback = await self.client.post("/voice/fallback", data={"CallStatus": "completed"})
         fallback_xml = await fallback.text()
-        self.assertIn("Hi Seif, this is Sal.", fallback_xml)
+        self.assertIn(
+            "Hey Seif, it's Sal, Chief Operations Manager at NordSpecAuto.",
+            fallback_xml,
+        )
+        self.assertIn("The live line did not connect", fallback_xml)
         self.assertIn("Polly.Matthew", fallback_xml)
+
+    async def test_fallback_say_uses_sal_tts_voice(self) -> None:
+        self.setenv("SAL_TTS_VOICE", "Polly.Joanna")
+        self.setenv("SAL_LIVE_PUBLIC_BASE", None)
+        self.setenv("PUBLIC_BASE", None)
+
+        live = await self.client.post("/voice/live")
+        live_xml = await live.text()
+        self.assertEqual(live.status, 200)
+        self.assertIn("Polly.Joanna", live_xml)
+        self.assertNotIn("Polly.Matthew", live_xml)
+        self.assertIn("Chief Operations Manager at NordSpecAuto", live_xml)
+        self.assertIn("The live line did not connect", live_xml)
+
+        fallback = await self.client.post("/voice/fallback")
+        fallback_xml = await fallback.text()
+        self.assertIn("Polly.Joanna", fallback_xml)
+        self.assertNotIn("Polly.Matthew", fallback_xml)
+        self.assertIn(
+            "Hey Seif, it's Sal, Chief Operations Manager at NordSpecAuto.",
+            fallback_xml,
+        )
 
     async def test_health_and_api_when_secret_missing(self) -> None:
         self.setenv("SAL_BRIDGE_SECRET", None)
@@ -321,7 +349,14 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Open orders: 14. Stripe available: $1200.", system)
         self.assertIn("[END_CALL]", system)
         self.assertIn("approval card", system)
-        self.assertIn("NordSpecAuto", system)
+        self.assertIn("Chief Operations Manager at NordSpecAuto", system)
+        self.assertIn(
+            "Introduce yourself as Sal, Chief Operations Manager at NordSpecAuto.",
+            system,
+        )
+        self.assertIn("Never say you are an AI assistant, a bot, or an AI.", system)
+        self.assertNotIn("spoken aloud with standard text-to-speech", system)
+        self.assertNotIn("Chief Operating Manager", system)
         self.assertIn("morning_briefing", system)
 
         mid = await self.client.get(f"/api/sessions/{session_id}", headers=self.auth())
