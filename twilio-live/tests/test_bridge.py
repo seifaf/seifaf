@@ -59,6 +59,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self._saved: dict[str, str | None] = {}
         self.setenv("SAL_SESSIONS_PATH", os.path.join(self._tmp.name, "sessions.json"))
+        self.setenv("SAL_BRIDGE_PATH", os.path.join(self._tmp.name, "bridge.json"))
         self.setenv("SAL_BRIDGE_SECRET", "test-bridge-secret")
         self.setenv("SAL_LIVE_PUBLIC_BASE", "https://sal-live.onrender.com")
         self.setenv("PUBLIC_BASE", None)
@@ -597,6 +598,105 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             headers={"X-Twilio-Signature": other_sig},
         )
         self.assertEqual(other_call.status, 403)
+
+    async def test_bridge_question_and_answer_contract(self) -> None:
+        missing = await self.client.post("/bridge/questions", json={"question": "Did it ship?"})
+        self.assertEqual(missing.status, 401)
+        self.assertEqual((await missing.json())["error"], "unauthorized")
+        wrong = await self.client.get(
+            "/bridge/questions",
+            headers={"Authorization": "Bearer nope"},
+        )
+        self.assertEqual(wrong.status, 401)
+
+        empty = await self.client.post("/bridge/questions", headers=self.auth(), json={"question": "  "})
+        self.assertEqual(empty.status, 400)
+
+        created = await self.create(caller_note="bridge")
+        posted = await self.client.post(
+            "/bridge/questions",
+            headers=self.auth(),
+            json={"question": "Did the G30 bumper ship?", "session_id": created["session_id"]},
+        )
+        self.assertEqual(posted.status, 200)
+        question = await posted.json()
+        self.assertEqual(
+            set(question),
+            {"id", "question", "session_id", "status", "answer", "created_at", "answered_at"},
+        )
+        self.assertEqual(question["question"], "Did the G30 bumper ship?")
+        self.assertEqual(question["session_id"], created["session_id"])
+        self.assertEqual(question["status"], "pending")
+        self.assertIsNone(question["answer"])
+        self.assertIsNone(question["answered_at"])
+        self.assertTrue(question["created_at"].endswith("Z"))
+
+        listing = await self.client.get("/bridge/questions", headers=self.auth())
+        self.assertEqual(listing.status, 200)
+        body = await listing.json()
+        self.assertEqual([item["id"] for item in body["questions"]], [question["id"]])
+
+        mode = os.stat(server.bridge_path()).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+        missing_id = await self.client.post(
+            "/bridge/answers",
+            headers=self.auth(),
+            json={"id": "missing", "answer": "no"},
+        )
+        self.assertEqual(missing_id.status, 404)
+        self.assertEqual((await missing_id.json())["error"], "not_found")
+
+        blank = await self.client.post(
+            "/bridge/answers",
+            headers=self.auth(),
+            json={"id": question["id"], "answer": " "},
+        )
+        self.assertEqual(blank.status, 400)
+
+        answered = await self.client.post(
+            "/bridge/answers",
+            headers=self.auth(),
+            json={"id": question["id"], "answer": "It shipped yesterday."},
+        )
+        self.assertEqual(answered.status, 200)
+        answer_body = await answered.json()
+        self.assertEqual(answer_body["status"], "answered")
+        self.assertEqual(answer_body["answer"], "It shipped yesterday.")
+        self.assertEqual(answer_body["question"], "Did the G30 bumper ship?")
+        self.assertTrue(answer_body["answered_at"].endswith("Z"))
+
+        again = await self.client.post(
+            "/bridge/answers",
+            headers=self.auth(),
+            json={"id": question["id"], "answer": "It shipped yesterday."},
+        )
+        self.assertEqual(again.status, 200)
+        conflict = await self.client.post(
+            "/bridge/answers",
+            headers=self.auth(),
+            json={"id": question["id"], "answer": "A different story."},
+        )
+        self.assertEqual(conflict.status, 409)
+        self.assertEqual((await conflict.json())["error"], "already_answered")
+
+        pending = await self.client.get("/bridge/questions", headers=self.auth())
+        self.assertEqual((await pending.json())["questions"], [])
+        answered_list = await self.client.get(
+            "/bridge/questions?status=answered",
+            headers=self.auth(),
+        )
+        self.assertEqual((await answered_list.json())["questions"][0]["id"], question["id"])
+        everything = await self.client.get("/bridge/questions?status=all", headers=self.auth())
+        self.assertEqual(len((await everything.json())["questions"]), 1)
+
+        bad_status = await self.client.get("/bridge/questions?status=nope", headers=self.auth())
+        self.assertEqual(bad_status.status, 400)
+
+        self.setenv("SAL_BRIDGE_SECRET", None)
+        unconfigured = await self.client.get("/bridge/questions")
+        self.assertEqual(unconfigured.status, 503)
+        self.assertEqual((await unconfigured.json())["error"], "bridge_not_configured")
 
 
 if __name__ == "__main__":
