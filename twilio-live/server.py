@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,8 @@ from urllib.parse import urlencode
 from aiohttp import ClientSession, ClientTimeout, web
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
+
+import lookups
 
 ROOT = Path(__file__).resolve().parent
 PERSONA = (ROOT / "sal_persona.txt").read_text(encoding="utf-8").strip()
@@ -32,7 +35,16 @@ EMPTY_GOODBYE = "Alright Seif, I'll take it from here. Talk soon."
 SEIF_E164 = "+14133061640"
 TERMINAL_CALL_STATUSES = {"completed", "busy", "no-answer", "failed", "canceled", "cancelled"}
 DEFAULT_SESSIONS_PATH = Path("/tmp/sal_live_sessions.json")
+DEFAULT_BRIDGE_PATH = Path("/tmp/sal_live_bridge.json")
 SESSION_KEEP = 100
+QUESTION_KEEP = 100
+LOOKUP_FILLER = "Give me a sec, checking."
+LOOKUP_STILL = "Still checking."
+LOOKUP_FOLLOWUP = "I'll follow up on that after this call."
+WRITE_REPLY = (
+    "I'll put that in chat for your approval. I won't send anything or move any money until you tap it."
+)
+STOP_REPLY = "Okay."
 
 FALLBACK_SAY = os.environ.get(
     "SAL_LIVE_FALLBACK_SAY",
@@ -45,9 +57,12 @@ You are mid-call, speaking out loud to Seif. Twilio will read your reply with te
 Rules for every reply:
 - One to three short spoken sentences. Sound natural, warm, and concise.
 - Zero markdown, no bullet or numbered lists, and no raw URLs.
-- Never invent facts that are missing from the live operational briefing. If the briefing does not contain the answer, say you will check.
+- Only state a figure when it is in the live operational briefing or in a tool result from this call. Say the date and the unit with that figure. If neither source has it, use a read-only tool now. Do not invent a number and do not promise to check later when a tool can answer on this call.
+- Read-only tools: stripe_recent_payments, admin_requests, and ask_team. Never send, refund, or take a payment with a tool.
+- If Seif asks you to send a message, issue a refund, or move money, say you will put it in chat for approval. Do not claim a customer was already contacted or that money already moved.
+- If Seif says stop talking or quit talking, reply with only Okay and do not add another thought.
 - When Seif gives an instruction or a decision, clearly repeat it back and confirm it so he knows you will execute it right after this call.
-- Internal work starts immediately. Any outgoing customer message or money move will place a ready-to-tap approval card in chat. Say that naturally when the instruction needs one. Do not claim a customer was already contacted or that money already moved.
+- Internal work starts immediately. Any outgoing customer message or money move will place a ready-to-tap approval card in chat. Say that naturally when the instruction needs one.
 - If Seif indicates he is done or hanging up, for example "that's all", "nothing else", "go ahead and do that, bye", or "thanks Sal", finish with a warm sign-off and append the literal token [END_CALL] at the very end of your reply. Do not speak the token as words; it is a control marker.
 """.strip()
 
@@ -69,6 +84,11 @@ _sessions: dict[str, dict] = {}
 _loaded = False
 _lock: asyncio.Lock | None = None
 _seq = 0
+_questions: dict[str, dict] = {}
+_bridge_loaded = False
+_bridge_lock: asyncio.Lock | None = None
+_lookups: dict[str, dict] = {}
+_lookup_tasks: dict[str, asyncio.Task] = {}
 
 
 def load_dotenv() -> None:
@@ -151,6 +171,25 @@ def sessions_path() -> Path:
     return Path(raw) if raw else DEFAULT_SESSIONS_PATH
 
 
+def bridge_path() -> Path:
+    raw = (os.environ.get("SAL_BRIDGE_PATH") or "").strip()
+    return Path(raw) if raw else DEFAULT_BRIDGE_PATH
+
+
+def ask_team_wait_seconds() -> float:
+    raw = (os.environ.get("SAL_ASK_TEAM_WAIT_SECONDS") or "").strip()
+    if not raw:
+        return 20.0
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return 20.0
+
+
+def lookup_budget_seconds() -> float:
+    return ask_team_wait_seconds() + 8.0
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -173,23 +212,31 @@ def bridge_secret() -> str:
 
 
 def reset_store() -> None:
-    """Drop the in-memory session cache. The sessions file is left in place."""
-    global _loaded, _lock, _seq
+    """Drop the in-memory session and bridge caches. Files are left in place."""
+    global _loaded, _lock, _seq, _bridge_loaded, _bridge_lock
+    for task in list(_lookup_tasks.values()):
+        if not task.done():
+            task.cancel()
+    _lookup_tasks.clear()
+    _lookups.clear()
     _sessions.clear()
+    _questions.clear()
     _loaded = False
+    _bridge_loaded = False
     _lock = None
+    _bridge_lock = None
     _seq = 0
 
 
 def clear_store() -> None:
-    """Drop memory and delete the sessions file. Used by tests."""
+    """Drop memory and delete the session and bridge files. Used by tests."""
     reset_store()
-    path = sessions_path()
-    try:
-        if path.exists():
-            path.unlink()
-    except OSError:
-        LOG.exception("could not delete sessions file")
+    for path in (sessions_path(), bridge_path()):
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            LOG.exception("could not delete store file")
 
 
 def get_lock() -> asyncio.Lock:
@@ -369,7 +416,7 @@ def public_view(session: dict) -> dict:
         "turns": session.get("turns") or [],
         "user_utterances": user_utterances(session),
         "summary": session.get("summary"),
-        "action_items": session.get("action_items"),
+        "action_items": displayed_action_items(session),
     }
 
 
@@ -400,7 +447,13 @@ def say_chunks(text: str, limit: int = 3500) -> list[str]:
     return chunks or ["Okay."]
 
 
-def render_gather(say_text: str, action_url: str, redirect_url: str | None) -> str:
+def render_gather(
+    say_text: str,
+    action_url: str,
+    redirect_url: str | None,
+    *,
+    timeout: int = 12,
+) -> str:
     response = VoiceResponse()
     gather = response.gather(
         input="speech",
@@ -411,7 +464,7 @@ def render_gather(say_text: str, action_url: str, redirect_url: str | None) -> s
         language="en-US",
         action=action_url,
         method="POST",
-        timeout=12,
+        timeout=timeout,
     )
     voice = tts_voice()
     for chunk in say_chunks(say_text):
@@ -504,18 +557,43 @@ def parse_duration(value: object) -> int | str | None:
 
 
 async def chat_complete(messages: list[dict], *, timeout: float = 12, max_tokens: int = 220) -> str:
+    message = await llm_complete(messages, tools=None, timeout=timeout, max_tokens=max_tokens)
+    if isinstance(message, str):
+        return message.strip()
+    return str((message or {}).get("content") or "").strip()
+
+
+async def llm_complete(
+    messages: list[dict],
+    *,
+    tools: list[dict] | None = None,
+    timeout: float = 12,
+    max_tokens: int = 220,
+) -> dict:
+    """One chat-completions call. Tests that patch chat_complete keep working."""
+    if chat_complete is not _ORIGINAL_CHAT_COMPLETE:
+        text = await chat_complete(messages, timeout=timeout, max_tokens=max_tokens)
+        if isinstance(text, dict):
+            return text
+        return {"role": "assistant", "content": text, "tool_calls": None}
+    return await _llm_http(messages, tools=tools, timeout=timeout, max_tokens=max_tokens)
+
+
+async def _llm_http(
+    messages: list[dict],
+    *,
+    tools: list[dict] | None,
+    timeout: float,
+    max_tokens: int,
+) -> dict:
     base, key, model = llm_config()
+    payload = lookups.chat_payload(model, messages, tools=tools, max_tokens=max_tokens)
     client_timeout = ClientTimeout(total=timeout)
     async with ClientSession(timeout=client_timeout) as session:
         async with session.post(
             f"{base.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": messages,
-                "temperature": 0.3,
-                "max_tokens": max_tokens,
-            },
+            json=payload,
         ) as resp:
             try:
                 body = await resp.json(content_type=None)
@@ -526,10 +604,15 @@ async def chat_complete(messages: list[dict], *, timeout: float = 12, max_tokens
                 LOG.error("LLM error status=%s", resp.status)
                 raise RuntimeError(f"LLM HTTP {resp.status}")
             try:
-                content = body["choices"][0]["message"]["content"]
+                message = body["choices"][0]["message"]
             except (KeyError, IndexError, TypeError) as exc:
-                raise RuntimeError("LLM response missing content") from exc
-            return str(content or "").strip()
+                raise RuntimeError("LLM response missing message") from exc
+            if not isinstance(message, dict):
+                raise RuntimeError("LLM response missing message")
+            return message
+
+
+_ORIGINAL_CHAT_COMPLETE = chat_complete
 
 
 async def extract_action_items(session: dict) -> tuple[str, list[dict]]:
@@ -563,18 +646,82 @@ def transcript_text(session: dict) -> str:
     return "\n".join(lines)
 
 
+def logged_items(session: dict) -> list[dict]:
+    items: list[dict] = []
+    for item in session.get("logged_action_items") or []:
+        if isinstance(item, dict):
+            text = str(item.get("instruction") or "").strip()
+        elif isinstance(item, str):
+            text = item.strip()
+        else:
+            continue
+        if text:
+            items.append({"instruction": text})
+    return items
+
+
+def merge_action_items(*groups: list[dict] | None) -> list[dict]:
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("instruction") or "").strip()
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                merged.append({"instruction": text})
+    return merged
+
+
+def displayed_action_items(session: dict) -> list[dict] | None:
+    extracted = session.get("action_items")
+    logged = logged_items(session)
+    if extracted is None:
+        return logged or None
+    if not isinstance(extracted, list):
+        return logged or None
+    return merge_action_items(extracted, logged)
+
+
+async def log_action_item(session_id: str, instruction: str) -> None:
+    text = (instruction or "").strip()
+    if not text:
+        return
+
+    def apply(session: dict) -> None:
+        items = session.setdefault("logged_action_items", [])
+        if not any(isinstance(item, dict) and item.get("instruction") == text for item in items):
+            items.append({"instruction": text})
+
+    await update_session(session_id, apply)
+
+
 async def ensure_action_items(session_id: str) -> dict | None:
     existing = await snapshot_session(session_id)
     if existing is None:
         return None
-    if existing.get("action_items") is not None or not user_utterances(existing):
+    if not user_utterances(existing):
+        return existing
+    if existing.get("action_items") is not None:
+        merged = merge_action_items(existing.get("action_items"), logged_items(existing))
+        if merged != existing.get("action_items"):
+
+            def apply_merge(session: dict) -> None:
+                session["action_items"] = merge_action_items(
+                    session.get("action_items"), logged_items(session)
+                )
+
+            updated = await update_session(session_id, apply_merge)
+            return updated or existing
         return existing
     summary, items = await extract_action_items(existing)
 
     def apply(session: dict) -> None:
         if session.get("action_items") is None:
             session["summary"] = summary
-            session["action_items"] = items
+            session["action_items"] = merge_action_items(items, logged_items(session))
 
     updated = await update_session(session_id, apply)
     return updated or existing
@@ -593,20 +740,53 @@ def conversation_messages(session: dict) -> list[dict]:
     return messages
 
 
-async def llm_reply(session: ClientSession, history: list[dict]) -> str:
-    base, key, model = llm_config()
-    messages = [{"role": "system", "content": persona_text()}] + history
-    async with session.post(
-        f"{base}/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"model": model, "messages": messages, "temperature": 0.4, "max_tokens": 220},
-        timeout=60,
-    ) as resp:
-        body = await resp.json()
-        if resp.status >= 400:
-            LOG.error("LLM error %s %s", resp.status, body)
-            return "Sorry Seif, I hit a snag talking to the model. Try again in a moment."
-        return body["choices"][0]["message"]["content"].strip()
+def relay_system() -> str:
+    return (
+        f"{persona_text()}\n\n{SPOKEN_RULES}\n\n"
+        "Live operational briefing for this call:\n"
+        "(No live briefing was attached to this call. Do not guess operational facts.)"
+    )
+
+
+def spoken_from_message(message: dict, *, empty_fallback: str) -> tuple[str, bool]:
+    raw = str((message or {}).get("content") or "")
+    clean, end_call = split_end_call(raw)
+    clean = normalize_spoken(clean)
+    if not clean:
+        clean = EMPTY_GOODBYE if end_call else empty_fallback
+    return clean, end_call
+
+
+async def record_assistant(session_id: str, clean: str, end_call: bool) -> None:
+    def apply(session: dict) -> None:
+        session["turns"].append({"role": "assistant", "content": clean, "ts": now_iso()})
+        if end_call:
+            session["ended_by_assistant"] = True
+            session["status"] = "completed"
+            session["end_reason"] = "assistant"
+            if not session.get("ended_at"):
+                session["ended_at"] = now_iso()
+
+    await update_session(session_id, apply)
+
+
+def speech_twiml(request: web.Request, session_id: str, clean: str, end_call: bool) -> str:
+    if end_call:
+        return render_say_hangup(clean)
+    return render_gather(
+        clean,
+        signed_url(request, "/voice/turn", session_id),
+        signed_url(request, "/voice/reprompt", session_id, n=1),
+    )
+
+
+def hold_twiml(request: web.Request, session_id: str, lookup_id: str, say_text: str) -> str:
+    return render_gather(
+        say_text,
+        signed_url(request, "/voice/turn", session_id),
+        signed_url(request, "/voice/resume", session_id, lookup=lookup_id),
+        timeout=1,
+    )
 
 
 def twiml_live() -> str:
@@ -764,6 +944,294 @@ def inbound_allowed(request: web.Request, params: dict[str, str]) -> bool:
     return from_ok
 
 
+def get_bridge_lock() -> asyncio.Lock:
+    global _bridge_lock
+    if _bridge_lock is None:
+        _bridge_lock = asyncio.Lock()
+    return _bridge_lock
+
+
+def _read_bridge() -> dict:
+    path = bridge_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOG.exception("could not read bridge file")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    clean: dict[str, dict] = {}
+    for value in data.values():
+        if isinstance(value, dict) and value.get("id") and value.get("question"):
+            clean[str(value["id"])] = value
+    return clean
+
+
+def _ensure_bridge() -> None:
+    global _bridge_loaded
+    if _bridge_loaded:
+        return
+    loaded = _read_bridge()
+    _questions.clear()
+    _questions.update(loaded)
+    _bridge_loaded = True
+
+
+def _persist_bridge() -> None:
+    ranked = sorted(
+        _questions.values(),
+        key=lambda question: question.get("created_at") or "",
+        reverse=True,
+    )[:QUESTION_KEEP]
+    trimmed = {question["id"]: question for question in ranked}
+    if len(trimmed) != len(_questions):
+        _questions.clear()
+        _questions.update(trimmed)
+    path = bridge_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".sal-bridge-", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(trimmed, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o600)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def public_question(question: dict) -> dict:
+    return {
+        "id": question.get("id"),
+        "question": question.get("question"),
+        "session_id": question.get("session_id"),
+        "status": question.get("status"),
+        "answer": question.get("answer"),
+        "created_at": question.get("created_at"),
+        "answered_at": question.get("answered_at"),
+    }
+
+
+async def enqueue_question(question: str, session_id: str | None) -> dict:
+    async with get_bridge_lock():
+        _ensure_bridge()
+        question_id = str(uuid.uuid4())
+        record = {
+            "id": question_id,
+            "question": question,
+            "session_id": session_id or None,
+            "status": "pending",
+            "answer": None,
+            "created_at": now_iso(),
+            "answered_at": None,
+        }
+        _questions[question_id] = record
+        _persist_bridge()
+        return copy.deepcopy(record)
+
+
+async def snapshot_question(question_id: str) -> dict | None:
+    async with get_bridge_lock():
+        _ensure_bridge()
+        question = _questions.get(question_id)
+        return copy.deepcopy(question) if question else None
+
+
+async def list_questions(status: str) -> list[dict]:
+    async with get_bridge_lock():
+        _ensure_bridge()
+        rows = [copy.deepcopy(row) for row in _questions.values()]
+    if status != "all":
+        rows = [row for row in rows if row.get("status") == status]
+    rows.sort(key=lambda row: row.get("created_at") or "")
+    return rows
+
+
+async def answer_question(question_id: str, answer: str) -> tuple[dict, int]:
+    async with get_bridge_lock():
+        _ensure_bridge()
+        question = _questions.get(question_id)
+        if question is None:
+            return {"error": "not_found"}, 404
+        existing = (question.get("answer") or "").strip()
+        if question.get("status") == "answered":
+            if existing == answer:
+                return public_question(question), 200
+            return {
+                "error": "already_answered",
+                "id": question["id"],
+                "status": "answered",
+                "answer": question.get("answer"),
+            }, 409
+        question["status"] = "answered"
+        question["answer"] = answer
+        question["answered_at"] = now_iso()
+        _persist_bridge()
+        return public_question(question), 200
+
+
+async def ask_team(question: str, *, session_id: str | None, still_current) -> str:
+    cleaned = re.sub(r"\s+", " ", (question or "").strip())
+    if not cleaned:
+        return "No question was provided. Tell Seif you will follow up after the call. Do not invent an answer."
+    if len(cleaned) > 1000:
+        cleaned = cleaned[:1000]
+    record = await enqueue_question(cleaned, session_id)
+    deadline = time.monotonic() + ask_team_wait_seconds()
+    while time.monotonic() < deadline:
+        if not still_current():
+            return "The caller moved on. Do not answer this question out loud."
+        current = await snapshot_question(record["id"])
+        if current and current.get("status") == "answered" and (current.get("answer") or "").strip():
+            return f"Team answer: {str(current['answer']).strip()}"
+        await asyncio.sleep(0.2)
+    waited = int(ask_team_wait_seconds())
+    return (
+        f"No team answer arrived within {waited} seconds. "
+        "Tell Seif you will follow up after the call. Do not invent an answer."
+    )
+
+
+async def execute_tool(name: str, arguments: dict, *, session_id: str | None, still_current) -> str:
+    LOG.info("tool %s session=%s", name, session_id or "")
+    if name == "ask_team":
+        return await ask_team(
+            str(arguments.get("question") or ""),
+            session_id=session_id,
+            still_current=still_current,
+        )
+    return await lookups.run_read_tool(name, arguments)
+
+
+def _skipped_message() -> dict:
+    return {"role": "assistant", "content": "", "skipped": True}
+
+
+async def resolve_after_tools(
+    messages: list[dict],
+    first: dict,
+    *,
+    session_id: str | None,
+    still_current,
+) -> dict:
+    """Run the tool calls already chosen, then ask the model for speech."""
+    thread = list(messages)
+    message = first
+    for round_index in range(2):
+        calls = lookups.tool_calls_of(message)
+        if not calls:
+            return message
+        thread.append(
+            {
+                "role": "assistant",
+                "content": message.get("content"),
+                "tool_calls": message.get("tool_calls"),
+            }
+        )
+        for call in calls:
+            if not still_current():
+                return _skipped_message()
+            name = str((call.get("function") or {}).get("name") or "")
+            result = await execute_tool(
+                name,
+                lookups.tool_arguments(call),
+                session_id=session_id,
+                still_current=still_current,
+            )
+            if not still_current():
+                return _skipped_message()
+            thread.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "name": name,
+                    "content": result,
+                }
+            )
+        message = await llm_complete(
+            thread,
+            tools=lookups.READ_TOOLS if round_index == 0 else None,
+            timeout=12,
+            max_tokens=180,
+        )
+    return message
+
+
+def publish_lookup(state: dict, text: str, end_call: bool) -> None:
+    if state.get("status") != "running":
+        return
+    state["text"] = text
+    state["end_call"] = end_call
+    state["status"] = "ready"
+
+
+def cancel_lookup(session_id: str) -> None:
+    state = _lookups.get(session_id)
+    if state and state.get("status") == "running":
+        state["status"] = "cancelled"
+    task = _lookup_tasks.get(session_id)
+    if task and not task.done():
+        task.cancel()
+
+
+def start_lookup(session_id: str, messages: list[dict], first: dict) -> str:
+    lookup_id = str(uuid.uuid4())
+    state = {
+        "id": lookup_id,
+        "status": "running",
+        "started": time.monotonic(),
+        "text": None,
+        "end_call": False,
+        "delivered": False,
+        "held": True,
+    }
+    _lookups[session_id] = state
+
+    def still_current() -> bool:
+        current = _lookups.get(session_id)
+        return current is state and state.get("status") == "running"
+
+    async def runner() -> None:
+        try:
+            final = await resolve_after_tools(
+                messages,
+                first,
+                session_id=session_id,
+                still_current=still_current,
+            )
+            if final.get("skipped") or not still_current():
+                return
+            text, end_call = spoken_from_message(final, empty_fallback=LOOKUP_FOLLOWUP)
+            publish_lookup(state, text, end_call)
+        except asyncio.CancelledError:
+            if state.get("status") == "running":
+                state["status"] = "cancelled"
+            raise
+        except Exception:
+            LOG.exception("lookup failed session=%s", session_id)
+            publish_lookup(state, LOOKUP_FOLLOWUP, False)
+
+    _lookup_tasks[session_id] = asyncio.create_task(runner())
+    return lookup_id
+
+
+async def deliver_lookup(request: web.Request, session_id: str, state: dict) -> str:
+    text = state.get("text") or LOOKUP_FOLLOWUP
+    end_call = bool(state.get("end_call"))
+    if not state.get("delivered"):
+        state["delivered"] = True
+        state["status"] = "spoken"
+        await record_assistant(session_id, text, end_call)
+    return speech_twiml(request, session_id, text, end_call)
+
+
 async def handle_health(request: web.Request) -> web.Response:
     _assemble_openai_key_from_parts()
     xai_key = os.environ.get("XAI_API_KEY", "")
@@ -777,6 +1245,8 @@ async def handle_health(request: web.Request) -> web.Response:
             "mode": "conversation-relay",
             "bridge_configured": bool(os.environ.get("SAL_BRIDGE_SECRET")),
             "gather_ready": True,
+            "stripe_read_configured": lookups.stripe_restricted_key().startswith("rk_"),
+            "admin_read_configured": bool(lookups.admin_read_token()),
         }
     )
 
@@ -936,36 +1406,113 @@ async def handle_turn(request: web.Request) -> web.Response:
     snapshot = await update_session(session_id, apply_user)
     if snapshot is None:
         return web.Response(status=404, text="not_found")
+    cancel_lookup(session_id)
+    if lookups.is_stop_talking(speech):
+        if lookups.is_write_request(speech):
+            await log_action_item(session_id, speech)
+        await record_assistant(session_id, STOP_REPLY, False)
+        LOG.info("turn session=%s stop", session_id)
+        return xml_response(speech_twiml(request, session_id, STOP_REPLY, False))
+    if lookups.is_write_request(speech):
+        await log_action_item(session_id, speech)
+        await record_assistant(session_id, WRITE_REPLY, False)
+        LOG.info("turn session=%s write-approval", session_id)
+        return xml_response(speech_twiml(request, session_id, WRITE_REPLY, False))
+    messages = conversation_messages(snapshot)
     try:
-        raw_reply = await chat_complete(conversation_messages(snapshot), timeout=12, max_tokens=180)
+        first = await llm_complete(messages, tools=lookups.READ_TOOLS, timeout=12, max_tokens=180)
     except Exception:
         LOG.exception("spoken reply failed session=%s", session_id)
-        raw_reply = "Sorry Seif, I hit a snag. Say that once more and I'll stay with you."
-    clean, end_call = split_end_call(raw_reply)
-    clean = normalize_spoken(clean)
-    if not clean:
-        clean = EMPTY_GOODBYE if end_call else "Sorry Seif, I missed that. What would you like me to jump on?"
-
-    def apply_assistant(session: dict) -> None:
-        session["turns"].append({"role": "assistant", "content": clean, "ts": now_iso()})
-        if end_call:
-            session["ended_by_assistant"] = True
-            session["status"] = "completed"
-            session["end_reason"] = "assistant"
-            if not session.get("ended_at"):
-                session["ended_at"] = now_iso()
-
-    await update_session(session_id, apply_assistant)
-    LOG.info("turn session=%s chars=%d end=%s", session_id, len(speech), end_call)
-    if end_call:
-        return xml_response(render_say_hangup(clean))
-    return xml_response(
-        render_gather(
-            clean,
-            signed_url(request, "/voice/turn", session_id),
-            signed_url(request, "/voice/reprompt", session_id, n=1),
-        )
+        first = {
+            "role": "assistant",
+            "content": "Sorry Seif, I hit a snag. Say that once more and I'll stay with you.",
+        }
+    if lookups.tool_calls_of(first):
+        lookup_id = start_lookup(session_id, messages, first)
+        LOG.info("turn session=%s lookup=%s", session_id, lookup_id)
+        return xml_response(hold_twiml(request, session_id, lookup_id, LOOKUP_FILLER))
+    clean, end_call = spoken_from_message(
+        first,
+        empty_fallback="Sorry Seif, I missed that. What would you like me to jump on?",
     )
+    await record_assistant(session_id, clean, end_call)
+    LOG.info("turn session=%s chars=%d end=%s", session_id, len(speech), end_call)
+    return xml_response(speech_twiml(request, session_id, clean, end_call))
+
+
+async def handle_resume(request: web.Request) -> web.Response:
+    denied = authorize_voice(request)
+    if denied:
+        return denied
+    session_id = request.query.get("sid", "")
+    if await snapshot_session(session_id) is None:
+        return web.Response(status=404, text="not_found")
+    lookup_id = request.query.get("lookup", "")
+    state = _lookups.get(session_id)
+    if state is None or state.get("id") != lookup_id:
+        return xml_response(speech_twiml(request, session_id, "Go ahead, Seif.", False))
+    if state.get("status") == "running" and time.monotonic() - float(state.get("started") or 0) >= lookup_budget_seconds():
+        publish_lookup(state, LOOKUP_FOLLOWUP, False)
+    if state.get("status") in {"ready", "spoken"} and (state.get("text") or state.get("delivered")):
+        xml = await deliver_lookup(request, session_id, state)
+        return xml_response(xml)
+    if state.get("status") == "cancelled":
+        return xml_response(speech_twiml(request, session_id, "Go ahead, Seif.", False))
+    return xml_response(hold_twiml(request, session_id, lookup_id, LOOKUP_STILL))
+
+
+async def handle_post_question(request: web.Request) -> web.Response:
+    denied = authorize_api(request)
+    if denied:
+        return denied
+    try:
+        data = await read_json_object(request)
+        question = optional_str(data, "question")
+        session_id = optional_str(data, "session_id")
+    except web.HTTPBadRequest as exc:
+        return web.json_response({"error": "invalid_json", "detail": exc.text}, status=400)
+    except ValueError as exc:
+        return web.json_response({"error": "invalid_body", "detail": str(exc)}, status=400)
+    if question is None or not question.strip():
+        return web.json_response({"error": "invalid_body", "detail": "question is required"}, status=400)
+    record = await enqueue_question(question.strip(), session_id.strip() if session_id else None)
+    LOG.info("bridge question id=%s", record["id"])
+    return web.json_response(public_question(record))
+
+
+async def handle_list_questions(request: web.Request) -> web.Response:
+    denied = authorize_api(request)
+    if denied:
+        return denied
+    status = (request.query.get("status") or "pending").strip().lower()
+    if status not in {"pending", "answered", "all"}:
+        return web.json_response(
+            {"error": "invalid_query", "detail": "status must be pending, answered, or all"},
+            status=400,
+        )
+    questions = await list_questions(status)
+    return web.json_response({"questions": [public_question(question) for question in questions]})
+
+
+async def handle_post_answer(request: web.Request) -> web.Response:
+    denied = authorize_api(request)
+    if denied:
+        return denied
+    try:
+        data = await read_json_object(request)
+        question_id = optional_str(data, "id")
+        answer = optional_str(data, "answer")
+    except web.HTTPBadRequest as exc:
+        return web.json_response({"error": "invalid_json", "detail": exc.text}, status=400)
+    except ValueError as exc:
+        return web.json_response({"error": "invalid_body", "detail": str(exc)}, status=400)
+    if question_id is None or not question_id.strip():
+        return web.json_response({"error": "invalid_body", "detail": "id is required"}, status=400)
+    if answer is None or not answer.strip():
+        return web.json_response({"error": "invalid_body", "detail": "answer is required"}, status=400)
+    body, status = await answer_question(question_id.strip(), answer.strip())
+    LOG.info("bridge answer id=%s status=%s", question_id.strip(), status)
+    return web.json_response(body, status=status)
 
 
 async def handle_reprompt(request: web.Request) -> web.Response:
@@ -1060,36 +1607,70 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
     LOG.info("WebSocket connected from %s", request.remote)
     history: list[dict] = []
-    async with ClientSession() as session:
-        async for msg in ws:
-            if msg.type != web.WSMsgType.TEXT:
-                if msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
-                    break
-                continue
-            try:
-                event = json.loads(msg.data)
-            except json.JSONDecodeError:
-                continue
-            etype = event.get("type")
-            LOG.info("WS event %s", etype)
-            if etype == "setup":
-                continue
-            if etype == "prompt":
-                user_text = event.get("voicePrompt") or event.get("transcript") or ""
-                if not user_text.strip():
-                    continue
-                history.append({"role": "user", "content": user_text})
-                try:
-                    reply = await llm_reply(session, history[-12:])
-                except Exception as exc:
-                    LOG.exception("LLM failed")
-                    reply = f"I could not reach the language model. {exc}"
-                history.append({"role": "assistant", "content": reply})
-                await ws.send_json({"type": "text", "token": reply, "last": True})
-            elif etype == "interrupt":
-                continue
-            elif etype == "error":
-                LOG.error("CR error %s", event)
+    generation = 0
+    async for msg in ws:
+        if msg.type != web.WSMsgType.TEXT:
+            if msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                break
+            continue
+        try:
+            event = json.loads(msg.data)
+        except json.JSONDecodeError:
+            continue
+        etype = event.get("type")
+        LOG.info("WS event %s", etype)
+        if etype == "setup":
+            continue
+        if etype == "interrupt":
+            generation += 1
+            continue
+        if etype == "error":
+            LOG.error("CR error %s", event)
+            continue
+        if etype != "prompt":
+            continue
+        user_text = (event.get("voicePrompt") or event.get("transcript") or "").strip()
+        if not user_text:
+            continue
+        generation += 1
+        turn_generation = generation
+        history.append({"role": "user", "content": user_text})
+        messages = [{"role": "system", "content": relay_system()}] + history[-16:]
+
+        def still_current() -> bool:
+            return turn_generation == generation
+
+        try:
+            if lookups.is_stop_talking(user_text):
+                reply = STOP_REPLY
+            elif lookups.is_write_request(user_text):
+                reply = WRITE_REPLY
+            else:
+                first = await llm_complete(messages, tools=lookups.READ_TOOLS, timeout=12, max_tokens=180)
+                if lookups.tool_calls_of(first):
+                    if still_current():
+                        await ws.send_json({"type": "text", "token": LOOKUP_FILLER + " ", "last": False})
+                    final = await resolve_after_tools(
+                        messages,
+                        first,
+                        session_id=None,
+                        still_current=still_current,
+                    )
+                    if final.get("skipped") or not still_current():
+                        continue
+                    reply, _end = spoken_from_message(final, empty_fallback=LOOKUP_FOLLOWUP)
+                else:
+                    reply, _end = spoken_from_message(
+                        first,
+                        empty_fallback="Sorry Seif, I missed that. What would you like me to jump on?",
+                    )
+        except Exception as exc:
+            LOG.exception("LLM failed")
+            reply = f"I could not reach the language model. {exc}"
+        if not still_current():
+            continue
+        history.append({"role": "assistant", "content": reply})
+        await ws.send_json({"type": "text", "token": reply, "last": True})
     LOG.info("WebSocket closed")
     return ws
 
@@ -1106,9 +1687,14 @@ def make_app() -> web.Application:
     app.router.add_get("/api/sessions", handle_list_sessions)
     app.router.add_get("/api/sessions/{sid}", handle_get_session)
     app.router.add_post("/api/sessions/{sid}/ack", handle_ack_session)
+    app.router.add_post("/bridge/questions", handle_post_question)
+    app.router.add_get("/bridge/questions", handle_list_questions)
+    app.router.add_post("/bridge/answers", handle_post_answer)
     app.router.add_get("/voice/gather", handle_gather)
     app.router.add_post("/voice/gather", handle_gather)
     app.router.add_post("/voice/turn", handle_turn)
+    app.router.add_post("/voice/resume", handle_resume)
+    app.router.add_get("/voice/resume", handle_resume)
     app.router.add_post("/voice/reprompt", handle_reprompt)
     app.router.add_post("/voice/status", handle_status)
     app.router.add_get("/voice/inbound", handle_inbound)
